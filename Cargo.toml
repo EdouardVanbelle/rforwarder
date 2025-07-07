@@ -1,0 +1,13 @@
+[package]
+name = "forwarder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml_ng = "0.9"
+polling = "3.8.0"
+signal-hook = "0.3"
+log = "0.4"
+#console_log = { version = "0.2", features = ["color"] }
+simple_logger = { version = "5.0", features = ["colors", "threads", "timestamps", "stderr"] }
