@@ -1,0 +1,24 @@
+implement:
+- join timeout
+- message timeout
+- disconnected timeout
+
+- strategies:
+    - keep peer on disconnected
+    - immediate disconnect peer first disconnect
+
+- Bench
+    - 1 thread polling
+    - multithread polling
+    - fork
+
+- read args in complement to config
+
+- support TLS
+
+- use HTTP & Websocket compliant ?
+- check auth ?
+- add an escape code ?
+
+
+

@@ -12,20 +12,27 @@ pub const MIN: usize = 100;
 
 const EOL: &'static str = "\r\n";
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+pub enum Strategy {
+    ClosePeerOnDisconnect,
+    KeepPeerOnDisconnect,
+}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 pub enum StreamMode {
     Init,
     WaitingPeer,
+    WaitingReconnect,
     Peered,
 }
 
 #[derive(Debug)]
 pub struct Stream {
-    pub connection: TcpStream,
-    pub peer: Option<TcpStream>,
+    pub conn_a: TcpStream,
+    pub conn_b: Option<TcpStream>,
     pub last_activity: Instant, // beware it is on both side (A & B)
     mode: StreamMode,
+    stratregy: Strategy,
     key: Option<usize>,
 }
 
@@ -36,9 +43,15 @@ pub enum Request {
     Noop,
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+pub enum PeerConnection {
+    A,
+    B
+}
+
 pub enum RequestError {
     BadSyntax,
-    ConnectionClosed,
+    ConnectionClosed(PeerConnection),
 }
 
 impl Request {
@@ -97,8 +110,6 @@ pub enum Response {
     WaitingPeer,
 }
 
-
-
 impl Response {
     fn as_bytes(&self) -> &[u8] {
         match self {
@@ -116,27 +127,30 @@ impl Response {
 pub enum ForwardStatus {
     Forwarded,
     NoPeer,
-    ConnectionClosed,
+    ConnectionClosed(PeerConnection),
 }
 
 impl Stream {
     pub fn new(connection: TcpStream) -> Stream {
-        connection.set_nonblocking(true).expect("error setting non blocking");
+        connection
+            .set_nonblocking(true)
+            .expect("error setting non blocking");
         Stream {
-            connection: connection,
-            peer: None,
+            conn_a: connection,
+            conn_b: None,
             key: None,
             last_activity: Instant::now(),
+            stratregy: Strategy::KeepPeerOnDisconnect,
             mode: StreamMode::Init,
         }
     }
 
-    pub fn upgrade_waiting_peer( &mut self, key: usize) {
+    pub fn upgrade_waiting_peer(&mut self, key: usize) {
         self.mode = StreamMode::WaitingPeer;
         self.key = Some(key);
     }
 
-    /* 
+    /*
     pub fn peer(&mut self, other: &mut Self) {
         self.peer = Some(other.connection.try_clone().expect("oops"));
         other.peer = Some(self.connection.try_clone().expect("ooops"));
@@ -146,8 +160,22 @@ impl Stream {
     }
     */
 
+    /// move conn_b to conn_a
+    pub fn downgrade_waiting_reconnect(&mut self, swap: bool) {
+        if swap {
+            log::debug!("swapping A with B");
+            if self.conn_b.is_none() {
+                panic!("Cannot swap connection if conn_b is not defined");
+            }
+            self.conn_a = self.conn_b.as_ref().unwrap().try_clone().expect("oops");
+        }
+
+        self.conn_b = None;
+        self.mode = StreamMode::WaitingReconnect;
+    }
+
     pub fn upgrade_peered(&mut self, peer: TcpStream) {
-        self.peer = Some(peer);
+        self.conn_b = Some(peer);
         self.mode = StreamMode::Peered;
     }
 
@@ -155,11 +183,15 @@ impl Stream {
         self.mode
     }
 
+    pub fn strategy(&self) -> Strategy {
+        self.stratregy
+    }
+
     pub fn forward_stream(&mut self, reverse: bool) -> ForwardStatus {
         // Do not read data till peer is not here
-        // FIXME: should remove poller to avoid any unnecessary events
+        // FIXME: should remove poller to avoid any unnecessary events, letting kernel to keep messages
         // FIXME: will create an infinite loop
-        if self.peer.is_none() {
+        if self.conn_b.is_none() {
             return ForwardStatus::NoPeer;
         }
 
@@ -172,7 +204,7 @@ impl Stream {
         //let mut writer = if reverse {  &self.connection } else { self.peer.as_mut().unwrap() };
 
         if reverse {
-            let c = self.peer.as_mut().unwrap().read(&mut buffer);
+            let c = self.conn_b.as_mut().unwrap().read(&mut buffer);
 
             match c {
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -186,26 +218,26 @@ impl Stream {
                 }
                 Ok(c) => {
                     if c == 0 {
-                        return ForwardStatus::ConnectionClosed;
+                        return ForwardStatus::ConnectionClosed(PeerConnection::B);
                     }
                     request_buf.extend(buffer);
 
                     self.last_activity = Instant::now();
 
-                    self.connection.write(&buffer);
+                    self.conn_a.write(&buffer);
                 }
             }
         } else {
-            let c = self.connection.read(&mut buffer).expect("read error");
+            let c = self.conn_a.read(&mut buffer).expect("read error");
 
             if c == 0 {
-                return ForwardStatus::ConnectionClosed;
+                return ForwardStatus::ConnectionClosed(PeerConnection::A);
             }
             request_buf.extend(buffer);
 
             self.last_activity = Instant::now();
 
-            self.peer.as_mut().unwrap().write(&buffer);
+            self.conn_b.as_mut().unwrap().write(&buffer);
         }
 
         //peer_stream.unwrap().connection.write(&buffer);
@@ -216,11 +248,11 @@ impl Stream {
     }
 
     pub fn answer(&mut self, response: Response) {
-        self.connection
-            .write( response.as_bytes())
+        self.conn_a
+            .write(response.as_bytes())
             .expect("error writing socket");
-        self.connection
-            .write( EOL.as_bytes())
+        self.conn_a
+            .write(EOL.as_bytes())
             .expect("error writing socket");
     }
 
@@ -229,10 +261,10 @@ impl Stream {
         let mut buffer = [0; 512];
 
         //FIXME: loop ?
-        let c = self.connection.read(&mut buffer).expect("read error");
+        let c = self.conn_a.read(&mut buffer).expect("read error");
 
         if c == 0 {
-            return Err(RequestError::ConnectionClosed);
+            return Err(RequestError::ConnectionClosed(PeerConnection::A));
         }
         request_buf.extend(buffer);
 
@@ -272,9 +304,10 @@ impl Stream {
     pub fn timeout(&mut self, auto_close: bool) -> bool {
         //FIXME: use config
         let timeout = match self.mode {
-            StreamMode::Init        => Some(Duration::new(10, 0)),
+            StreamMode::Init => Some(Duration::new(10, 0)),
             StreamMode::WaitingPeer => Some(Duration::new(30, 0)),
-            StreamMode::Peered      => Some(Duration::new(30, 0)),
+            StreamMode::Peered => Some(Duration::new(30, 0)),
+            StreamMode::WaitingReconnect => Some(Duration::new(30, 0)),
         };
 
         if timeout.is_none() {
@@ -286,14 +319,14 @@ impl Stream {
             log::info!(
                 "timeout on connection key {:?} - {} in phase {:?}",
                 self.key,
-                self.connection.peer_addr().unwrap(),
+                self.conn_a.peer_addr().unwrap(),
                 self.mode
             );
             if auto_close {
                 if self.mode != StreamMode::Peered {
                     self.answer(Response::Timeout);
                 }
-                self.connection.shutdown(Shutdown::Both);
+                self.conn_a.shutdown(Shutdown::Both);
             }
 
             // FIXME: what about monitoring peer ?

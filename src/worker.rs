@@ -115,15 +115,15 @@ impl Worker {
             self.poller
                 .add(connection, Event::readable(key))
                 .expect("unable to add poller");
-        }        
+        }
     }
 
     /** attach a stream */
-    pub fn attach(&mut self, mut stream: Stream, id: usize) {
+    pub fn attach(&mut self, mut new_stream: Stream, id: usize) {
         log::info!(
             "{}: {} attaching connection to id {}",
             self.name,
-            stream.connection.peer_addr().unwrap(),
+            new_stream.conn_a.peer_addr().unwrap(),
             id
         );
         //FIXME better error handling
@@ -131,72 +131,110 @@ impl Worker {
         let current_stream = self.streams.get_mut(&id);
         match current_stream {
             Some(current) => {
-                if current.peer.is_some() {
-                    stream.answer(stream::Response::Busy);
+                if current.conn_b.is_some() {
+                    new_stream.answer(stream::Response::Busy);
 
-                    stream.connection.shutdown(Shutdown::Both);
-                    self.poller.delete(stream.connection);
+                    new_stream.conn_a.shutdown(Shutdown::Both);
+                    self.poller.delete(new_stream.conn_a);
                     return;
                 } else {
-                    stream.answer(stream::Response::Peered);
                     //stream.connection.write(b"joined as B\npeered\n");
                     // Notify A side
-                    current.answer(stream::Response::Peered);
-                    
                     //self.poll(&stream.connection, id + stream::MAX);
-                     
+
                     //FIXME : Dup
                     unsafe {
+                        let added = self
+                            .poller
+                            .add(&new_stream.conn_a, Event::readable(id + stream::MAX));
+                        match added {
+                            Ok(_) => log::debug!("stream add in poll"),
+                            Err(e) => {
+                                log::debug!("!!! Error adding poll: {}", e);
+                            }
+                        }
+                    }
+
+                    new_stream.answer(stream::Response::Peered);
+                    if current.mode() != stream::StreamMode::WaitingReconnect {
+                        current.answer(stream::Response::Peered);
+                    }
+                    current.upgrade_peered(new_stream.conn_a);
+                    log::debug!("attached as B");
+
+                    // poll messages from A side, B side is already polled
+                    unsafe {
                         self.poller
-                            .add(&stream.connection, Event::readable(id + stream::MAX))
-                            .expect("unable to add poller");
-                    }   
-                    
-                    current.upgrade_peered( stream.connection);
+                            .add(&current.conn_a, Event::readable(id))
+                            .expect("oops");
+                    }
                 }
             }
             None => {
                 //stream.connection.write(b"joined as A\nwaiting peer\n");
-                stream.answer(stream::Response::WaitingPeer);
-                stream.upgrade_waiting_peer(id);
-                self.poll(&stream.connection, id);
-                self.streams.insert(id, stream);
+                new_stream.answer(stream::Response::WaitingPeer);
+                new_stream.upgrade_waiting_peer(id);
+                //XXX: do not poll right now, wait for B peer: self.poll(&new_stream.conn_a, id);
+                self.streams.insert(id, new_stream);
             }
         }
     }
 
-    pub fn detach(&mut self, key: usize, close: bool) {
-        let stream = self.streams.get(&key);
+    pub fn detach(&mut self, key: usize, peer: stream::PeerConnection, close: bool) {
+        let stream = self.streams.get_mut(&key);
         if stream.is_none() {
             log::debug!("stream not found for key {}", key);
             return;
         }
         let stream = stream.unwrap();
-        if close {
-            let _ = stream.connection.shutdown(Shutdown::Both);
 
-            // FIXME close peer ?
-            //let peer = Self::peer_id(key);
-            //self.detach(peer, true);
-        }
-
-        self.poller
-            .delete(&stream.connection)
-            .expect("connection not found");
-
-        if stream.peer.is_some() {
-            //2 options: close the B side too or move B side to A side
-            let peer = stream.peer.as_ref().unwrap();
-            if close {
-                let _ = peer.shutdown(Shutdown::Both);
+        match peer {
+            stream::PeerConnection::A => {
+                if close {
+                    let _ = stream.conn_a.shutdown(Shutdown::Both);
+                }
+                log::debug!("un-polling peerA");
+                self.poller
+                    .delete(&stream.conn_a)
+                    .expect("connection not found");
             }
-            self.poller
-                .delete(&peer)
-                .expect("connection not found");
-            // FIXME: remove key + MAX ?
+            stream::PeerConnection::B => {
+                log::debug!("un-polling peerB");
+                let conn_b = stream.conn_b.as_ref().unwrap();
+                if close {
+                    let _ = conn_b.shutdown(Shutdown::Both);
+                }
+                self.poller.delete(&conn_b).expect("connection not found");
+            }
         }
-        self.streams.remove(&key).expect("oops");
 
+        if stream.conn_b.is_none() {
+            // no peer, clean up
+            log::debug!("no peer, clean up streams");
+            self.streams.remove(&key).expect("oops");
+            return;
+        }
+
+        match stream.strategy() {
+            stream::Strategy::ClosePeerOnDisconnect => {
+                log::debug!("strategy: close peers on disconnect");
+                self.streams.remove(&key).expect("oops");
+            }
+            stream::Strategy::KeepPeerOnDisconnect => {
+                log::debug!("strategy: keep peers on disconnect");
+                match peer {
+                    stream::PeerConnection::A => {
+
+                        // remove to poller, will be polled once upgraded
+                        self.poller.delete( stream.conn_b.as_ref().unwrap()).expect("chiotte");
+
+                        stream.downgrade_waiting_reconnect(true);
+
+                    }
+                    stream::PeerConnection::B => stream.downgrade_waiting_reconnect(false),
+                }
+            }
+        }
     }
 
     pub fn join(self) {
@@ -236,7 +274,7 @@ impl Worker {
                         log::warn!("error while acceoting a connection: {}", e);
                         continue;
                     }
-                    Ok((mut connection, remote_addr)) => {
+                    Ok((connection, remote_addr)) => {
                         // FIXME: rate limit...
 
                         log::info!("#accepting connection from {}", remote_addr);
@@ -247,14 +285,14 @@ impl Worker {
 
                         stream.answer(stream::Response::Welcome);
                         self.id += 1;
-                        self.poll(&stream.connection, self.id);
-                        
+                        self.poll(&stream.conn_a, self.id);
+
                         /*
                         let worker = workers.get(round_robin).unwrap();
                         let _ = worker.send(Message::Attach(connection.try_clone()?));
                         round_robin = (round_robin + 1) % workers.len();
                         */
-                        
+
                         self.streams.insert(self.id, stream);
                     }
                 }
@@ -283,7 +321,7 @@ impl Worker {
                 stream.answer(stream::Response::Exit);
             }
             self.poller
-                .delete(&stream.connection)
+                .delete(&stream.conn_a)
                 .expect("connection not found");
         }
         self.streams.clear();
@@ -322,7 +360,7 @@ impl Worker {
                     log::info!(
                         "{}: {} attaching for id {}",
                         self.name,
-                        stream.connection.peer_addr().unwrap(),
+                        stream.conn_a.peer_addr().unwrap(),
                         id
                     );
                     self.attach(stream, id);
@@ -350,7 +388,7 @@ impl Worker {
 
         for (id, stream) in self.streams.iter_mut() {
             if stream.timeout(true) {
-                self.poller.delete(&stream.connection);
+                self.poller.delete(&stream.conn_a);
                 to_remove.push(*id);
                 continue;
             }
@@ -373,7 +411,7 @@ impl Worker {
             .get_mut(&real_key)
             .expect("unable to foind connection");
 
-        let addr = stream.connection.peer_addr();
+        let addr = stream.conn_a.peer_addr();
         let peer_addr = if addr.is_ok() {
             addr.unwrap().to_string()
         } else {
@@ -383,9 +421,14 @@ impl Worker {
         if self.listener.is_none() {
             // in a thread
             match stream.forward_stream(reverse) {
-                ForwardStatus::ConnectionClosed => {
-                    log::info!("{}: {} Connection is closed", self.name, peer_addr);
-                    self.detach(real_key, false);
+                ForwardStatus::ConnectionClosed(peer) => {
+                    log::info!(
+                        "{}: {} Connection {:?} is closed",
+                        self.name,
+                        peer_addr,
+                        peer
+                    );
+                    self.detach(real_key, peer, false);
                     return;
                 }
                 ForwardStatus::Forwarded => (),
@@ -398,9 +441,9 @@ impl Worker {
             log::debug!("reading header");
             match stream.read_init() {
                 Ok(Request::Noop) => {}
-                Err(RequestError::ConnectionClosed) => {
+                Err(RequestError::ConnectionClosed(peer)) => {
                     log::info!("{}: {} Connection ended", self.name, peer_addr);
-                    self.detach(real_key, false);
+                    self.detach(real_key, peer, false);
                     return;
                 }
                 Err(RequestError::BadSyntax) => {
@@ -410,8 +453,8 @@ impl Worker {
                     log::info!("{}: {} join request with id {}", self.name, peer_addr, id);
 
                     log::debug!("detach connection from root thread");
-                    let connection_copy = stream.connection.try_clone().expect("clone failed");
-                    self.detach(real_key, false);
+                    let connection_copy = stream.conn_a.try_clone().expect("clone failed");
+                    self.detach(real_key, stream::PeerConnection::A, false);
                     let index = id % self.workers.len();
 
                     // FIXME: check clone...
@@ -435,7 +478,8 @@ impl Worker {
                 }
                 Ok(Request::Close) => {
                     log::info!("{}: {} closing connection", self.name, peer_addr);
-                    self.detach(real_key, true);
+                    //FIXME should identify if A or B
+                    self.detach(real_key, stream::PeerConnection::A, true);
                     return;
                 }
             }
@@ -444,12 +488,15 @@ impl Worker {
         if reverse {
             log::debug!("polling peer");
             self.poller
-                .modify(&stream.peer.as_ref().unwrap(), Event::readable(original_key))
+                .modify(
+                    &stream.conn_b.as_ref().unwrap(),
+                    Event::readable(original_key),
+                )
                 .expect("unable to update poller");
         } else {
             log::debug!("polling stream");
             self.poller
-                .modify(&stream.connection, Event::readable(original_key))
+                .modify(&stream.conn_a, Event::readable(original_key))
                 .expect("unable to update poller");
         }
     }
