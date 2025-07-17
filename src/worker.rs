@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::Shutdown;
 use std::net::TcpListener;
 
@@ -133,14 +132,16 @@ impl Worker {
         match current_stream {
             Some(current) => {
                 if current.peer.is_some() {
-                    stream.connection.write(b"busy");
+                    stream.answer(stream::Response::Busy);
+
                     stream.connection.shutdown(Shutdown::Both);
                     self.poller.delete(stream.connection);
                     return;
                 } else {
-                    stream.connection.write(b"joined as B\npeered\n");
+                    stream.answer(stream::Response::Peered);
+                    //stream.connection.write(b"joined as B\npeered\n");
                     // Notify A side
-                    current.connection.write(b"peered\n");
+                    current.answer(stream::Response::Peered);
                     
                     //self.poll(&stream.connection, id + stream::MAX);
                      
@@ -155,7 +156,8 @@ impl Worker {
                 }
             }
             None => {
-                stream.connection.write(b"joined as A\nwaiting peer\n");
+                //stream.connection.write(b"joined as A\nwaiting peer\n");
+                stream.answer(stream::Response::WaitingPeer);
                 stream.upgrade_waiting_peer(id);
                 self.poll(&stream.connection, id);
                 self.streams.insert(id, stream);
@@ -239,13 +241,11 @@ impl Worker {
 
                         log::info!("#accepting connection from {}", remote_addr);
 
-                        connection.set_nonblocking(true).expect("error ");
-                        connection
-                            .write(b"Welcome to echo server (key words: keepalive, join, close, exit)\n")
-                            .expect("oops");
+                        //connection.set_nonblocking(true).expect("error ");
 
-                        let stream = stream::Stream::new(connection);
+                        let mut stream = stream::Stream::new(connection);
 
+                        stream.answer(stream::Response::Welcome);
                         self.id += 1;
                         self.poll(&stream.connection, self.id);
                         
@@ -280,7 +280,7 @@ impl Worker {
 
         for stream in self.streams.values_mut() {
             if stream.mode() == stream::StreamMode::Init {
-                stream.connection.write(b"exit\n");
+                stream.answer(stream::Response::Exit);
             }
             self.poller
                 .delete(&stream.connection)
@@ -437,9 +437,6 @@ impl Worker {
                     log::info!("{}: {} closing connection", self.name, peer_addr);
                     self.detach(real_key, true);
                     return;
-                }
-                Ok(Request::Keepalive) => {
-                    log::info!("{}: {} keepalive request", self.name, peer_addr);
                 }
             }
         }

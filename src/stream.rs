@@ -10,6 +10,9 @@ use std::{
 pub const MAX: usize = usize::MAX / 2 - 1;
 pub const MIN: usize = 100;
 
+const EOL: &'static str = "\r\n";
+
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 pub enum StreamMode {
     Init,
@@ -27,7 +30,6 @@ pub struct Stream {
 }
 
 pub enum Request {
-    Keepalive,
     Close,
     Exit,
     Join(usize),
@@ -47,7 +49,6 @@ impl Request {
 
         let command = tokens[0];
         match command {
-            "keepalive" => Ok(Request::Keepalive),
             "close" => Ok(Request::Close),
             "exit" => Ok(Request::Exit),
             "join" => {
@@ -72,7 +73,6 @@ impl Request {
 
     fn as_str(&self) -> &'static str {
         match self {
-            Request::Keepalive => "keepalive",
             Request::Close => "close",
             Request::Exit => "exit",
             Request::Join(_) => "join",
@@ -88,21 +88,27 @@ impl fmt::Display for Request {
 }
 
 pub enum Response {
-    Closed,
-    Error(String),
-    Joined(String),
+    Welcome,
     Timeout,
+    BadSyntax,
     Exit,
+    Busy,
+    Peered,
+    WaitingPeer,
 }
 
+
+
 impl Response {
-    fn as_string(&self) -> String {
+    fn as_bytes(&self) -> &[u8] {
         match self {
-            Response::Closed => String::from("Closed"),
-            Response::Exit => String::from("Exit"),
-            Response::Joined(side) => format!("Joined {}", side),
-            Response::Error(reason) => format!("Error: {}", reason),
-            Response::Timeout => String::from("Timeout"),
+            Response::Welcome => b"Welcome to echo server (key words: join, close, exit)",
+            Response::BadSyntax => b"bad-syntax",
+            Response::Exit => b"exit",
+            Response::Timeout => b"timeout",
+            Response::Busy => b"busy",
+            Response::Peered => b"peered",
+            Response::WaitingPeer => b"waiting-peer",
         }
     }
 }
@@ -115,6 +121,7 @@ pub enum ForwardStatus {
 
 impl Stream {
     pub fn new(connection: TcpStream) -> Stream {
+        connection.set_nonblocking(true).expect("error setting non blocking");
         Stream {
             connection: connection,
             peer: None,
@@ -208,6 +215,15 @@ impl Stream {
         ForwardStatus::Forwarded
     }
 
+    pub fn answer(&mut self, response: Response) {
+        self.connection
+            .write( response.as_bytes())
+            .expect("error writing socket");
+        self.connection
+            .write( EOL.as_bytes())
+            .expect("error writing socket");
+    }
+
     pub fn read_init(&mut self) -> Result<Request, RequestError> {
         let mut request_buf: Vec<u8> = vec![];
         let mut buffer = [0; 512];
@@ -231,9 +247,7 @@ impl Stream {
 
             match Request::from(tokens) {
                 Err(RequestError::BadSyntax) => {
-                    self.connection
-                        .write(b"bad syntax\n")
-                        .expect("error writing socket");
+                    self.answer(Response::BadSyntax);
 
                     // FIXME
                     return Err(RequestError::BadSyntax);
@@ -246,9 +260,9 @@ impl Stream {
                 }
                 Ok(request) => {
                     log::debug!("got a request: {}", request);
-                    self.connection
-                        .write(b"ok\n")
-                        .expect("error writing socket");
+                    //self.connection
+                    //    .write(b"ok\n")
+                    //    .expect("error writing socket");
                     return Ok(request);
                 }
             }
@@ -277,7 +291,7 @@ impl Stream {
             );
             if auto_close {
                 if self.mode != StreamMode::Peered {
-                    self.connection.write(b"timeout\n");
+                    self.answer(Response::Timeout);
                 }
                 self.connection.shutdown(Shutdown::Both);
             }
