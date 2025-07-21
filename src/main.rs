@@ -16,6 +16,7 @@ use std::sync::mpsc;
 mod config;
 mod stream;
 mod worker;
+mod pair;
 
 // TODO: prefer thread or workers ?
 

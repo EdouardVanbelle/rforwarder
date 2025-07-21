@@ -13,9 +13,9 @@ pub const MIN: usize = 100;
 const EOL: &'static str = "\r\n";
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
-pub enum Strategy {
-    ClosePeerOnDisconnect,
-    KeepPeerOnDisconnect,
+pub enum DisconnectStrategy {
+    Close,
+    Persist,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
@@ -32,13 +32,17 @@ pub struct Stream {
     pub conn_b: Option<TcpStream>,
     pub last_activity: Instant, // beware it is on both side (A & B)
     mode: StreamMode,
-    stratregy: Strategy,
+    strategy: DisconnectStrategy,
     key: Option<usize>,
+    //pub onJoin: Option<fn(&Self, key: usize)>,
+    pub onData: Option<fn(&Self, &[u8])>,
+    pub onClose: Option<fn(&Self)>,
 }
 
 pub enum Request {
     Close,
     Exit,
+    Strategy(DisconnectStrategy),
     Join(usize),
     Noop,
 }
@@ -63,7 +67,17 @@ impl Request {
         let command = tokens[0];
         match command {
             "close" => Ok(Request::Close),
-            "exit" => Ok(Request::Exit),
+            "exit" => Ok(Request::Exit), // FIXME: to remove
+            "strategy" => {
+                if tokens.len() != 2 {
+                    return Err(RequestError::BadSyntax);
+                }
+                match tokens[1] {
+                    "persist" => return Ok(Request::Strategy(DisconnectStrategy::Persist)),
+                    "close" => return Ok(Request::Strategy(DisconnectStrategy::Close)),
+                    _ => return Err(RequestError::BadSyntax),
+                }
+            }
             "join" => {
                 if tokens.len() != 2 {
                     return Err(RequestError::BadSyntax);
@@ -87,7 +101,7 @@ impl Request {
     fn as_str(&self) -> &'static str {
         match self {
             Request::Close => "close",
-            Request::Exit => "exit",
+            Request::Strategy(_) => "exit",
             Request::Join(_) => "join",
             _ => "",
         }
@@ -108,6 +122,7 @@ pub enum Response {
     Busy,
     Peered,
     WaitingPeer,
+    Ok,
 }
 
 impl Response {
@@ -120,6 +135,7 @@ impl Response {
             Response::Busy => b"busy",
             Response::Peered => b"peered",
             Response::WaitingPeer => b"waiting-peer",
+            Response::Ok => b"ok",
         }
     }
 }
@@ -131,7 +147,7 @@ pub enum ForwardStatus {
 }
 
 impl Stream {
-    pub fn new(connection: TcpStream) -> Stream {
+    pub fn new(connection: TcpStream, strategy: DisconnectStrategy) -> Stream {
         connection
             .set_nonblocking(true)
             .expect("error setting non blocking");
@@ -140,9 +156,15 @@ impl Stream {
             conn_b: None,
             key: None,
             last_activity: Instant::now(),
-            stratregy: Strategy::KeepPeerOnDisconnect,
+            strategy,
             mode: StreamMode::Init,
+            onData: None,
+            onClose: None,
         }
+    }
+
+    pub fn register_data_handler(&mut self, handler: fn(&Self, &[u8])) {
+        self.onData = Some(handler);
     }
 
     pub fn upgrade_waiting_peer(&mut self, key: usize) {
@@ -183,10 +205,13 @@ impl Stream {
         self.mode
     }
 
-    pub fn strategy(&self) -> Strategy {
-        self.stratregy
+    pub fn strategy(&self) -> DisconnectStrategy {
+        self.strategy
     }
 
+    pub fn set_strategy(&mut self, strategy: DisconnectStrategy) {
+        self.strategy = strategy;
+    }
     pub fn forward_stream(&mut self, reverse: bool) -> ForwardStatus {
         // Do not read data till peer is not here
         // FIXME: should remove poller to avoid any unnecessary events, letting kernel to keep messages
@@ -238,6 +263,10 @@ impl Stream {
             self.last_activity = Instant::now();
 
             self.conn_b.as_mut().unwrap().write(&buffer);
+
+            if self.onData.is_some() {
+                (self.onData.unwrap())(&self, &buffer);
+            }
         }
 
         //peer_stream.unwrap().connection.write(&buffer);

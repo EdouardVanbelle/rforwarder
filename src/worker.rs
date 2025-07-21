@@ -72,6 +72,10 @@ pub struct Worker {
     //ev,
 }
 
+pub fn event_handler(_: &stream::Stream) {
+    log::info!("Wow I got a message !");
+}
+
 impl Worker {
     pub fn new(to_parent: Sender<Message>, from_parent: Receiver<Message>) -> Worker {
         let current_thread = thread::current();
@@ -174,8 +178,12 @@ impl Worker {
                 //stream.connection.write(b"joined as A\nwaiting peer\n");
                 new_stream.answer(stream::Response::WaitingPeer);
                 new_stream.upgrade_waiting_peer(id);
+                new_stream.register_data_handler(|stream, buffer| { 
+                    log::info!("Wow I got a message from {}: {}", stream.conn_a.peer_addr().unwrap(), String::from_utf8_lossy(buffer));
+                });
                 //XXX: do not poll right now, wait for B peer: self.poll(&new_stream.conn_a, id);
                 self.streams.insert(id, new_stream);
+                
             }
         }
     }
@@ -216,12 +224,12 @@ impl Worker {
         }
 
         match stream.strategy() {
-            stream::Strategy::ClosePeerOnDisconnect => {
+            stream::DisconnectStrategy::Close => {
                 log::debug!("strategy: close peers on disconnect");
                 self.streams.remove(&key).expect("oops");
             }
-            stream::Strategy::KeepPeerOnDisconnect => {
-                log::debug!("strategy: keep peers on disconnect");
+            stream::DisconnectStrategy::Persist => {
+                log::debug!("strategy: persist peers on disconnect");
                 match peer {
                     stream::PeerConnection::A => {
 
@@ -281,7 +289,10 @@ impl Worker {
 
                         //connection.set_nonblocking(true).expect("error ");
 
-                        let mut stream = stream::Stream::new(connection);
+                        let mut stream = stream::Stream::new(
+                            connection, 
+                            stream::DisconnectStrategy::Close // default strategy
+                        );
 
                         stream.answer(stream::Response::Welcome);
                         self.id += 1;
@@ -454,6 +465,7 @@ impl Worker {
 
                     log::debug!("detach connection from root thread");
                     let connection_copy = stream.conn_a.try_clone().expect("clone failed");
+                    let strategy = stream.strategy();
                     self.detach(real_key, stream::PeerConnection::A, false);
                     let index = id % self.workers.len();
 
@@ -466,7 +478,7 @@ impl Worker {
                     self.workers
                         .get(index)
                         .unwrap()
-                        .send(Message::Attach(stream::Stream::new(connection_copy), id))
+                        .send(Message::Attach(stream::Stream::new(connection_copy, strategy), id))
                         .expect("error");
 
                     return;
@@ -475,6 +487,11 @@ impl Worker {
                     log::info!("{}: {} global exit requested", self.name, peer_addr);
                     self.notify_parent(Message::Exit);
                     return;
+                }
+                Ok(Request::Strategy(strategy)) => {
+                    log::info!("{}: {} switch strategy to {:?}", self.name, peer_addr, strategy);
+                    stream.set_strategy( strategy);
+                    stream.answer(stream::Response::Ok);
                 }
                 Ok(Request::Close) => {
                     log::info!("{}: {} closing connection", self.name, peer_addr);
